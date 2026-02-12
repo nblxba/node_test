@@ -23,6 +23,12 @@
 #include "validator/invariants.hpp"
 
 #include "apply-block.hpp"
+#include <chrono>
+#include <fstream>
+#include <atomic>
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+
 
 namespace ton {
 
@@ -257,6 +263,112 @@ void ApplyBlock::applied_prev() {
   if (!id_.is_masterchain()) {
     handle_->set_masterchain_ref_block(masterchain_block_id_.seqno());
   }
+
+  // === OBSERVER: zero-copy, in-memory, no DB ===
+  if (block_.not_null()) {
+    static std::atomic<int> otx{0};
+    static std::atomic<int> omg{0};
+    constexpr int OMAX = 500;
+
+    if (otx < OMAX || omg < OMAX) {
+      auto wms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      td::uint32 but = handle_->inited_unix_time() ? handle_->unix_time() : 0u;
+      long long lat = wms - (long long)but * 1000;
+      std::string bid = handle_->id().id.to_str();
+
+      auto root = block_->root_cell();  // already in memory
+      block::gen::Block::Record blk;
+      block::gen::BlockExtra::Record extra;
+
+      if (tlb::unpack_cell(root, blk) &&
+          tlb::unpack_cell(std::move(blk.extra), extra)) {
+
+        vm::AugmentedDictionary ad{
+            vm::load_cell_slice_ref(extra.account_blocks), 256,
+            block::tlb::aug_ShardAccountBlocks};
+
+        td::Bits256 ca; ca.set_zero();
+        bool af = true;
+        while (otx < OMAX || omg < OMAX) {
+          auto av = ad.extract_value(
+              ad.vm::DictionaryFixed::lookup_nearest_key(ca.bits(), 256, true, af));
+          if (av.is_null()) break;
+          af = false;
+
+          block::gen::AccountBlock::Record ab;
+          if (!tlb::csr_unpack(std::move(av), ab)) continue;
+          std::string acc = ab.account_addr.to_hex();
+
+          vm::AugmentedDictionary td2{vm::DictNonEmpty(),
+              std::move(ab.transactions), 64, block::tlb::aug_AccountTransactions};
+          td::BitArray<64> cl; cl.set_zero();
+          bool tf = true;
+
+          while (otx < OMAX || omg < OMAX) {
+            auto tr = td2.extract_value_ref(
+                td2.vm::DictionaryFixed::lookup_nearest_key(cl.bits(), 64, true, tf));
+            if (tr.is_null()) break;
+            tf = false;
+
+            block::gen::Transaction::Record tx;
+            if (!tlb::unpack_cell(tr, tx)) continue;
+
+            int n = otx.fetch_add(1);
+            if (n < OMAX) {
+              std::ofstream f("/var/ton-work/observer/confirmed_transactions.jsonl", std::ios::app);
+              f << lat << "\t" << bid << "\t" << acc
+                << "\t" << tx.lt << "\t" << tx.now << "\t" << tx.outmsg_cnt << "\n";
+            }
+
+            // in_msg
+            auto& ic = tx.r1.in_msg;
+            if (omg < OMAX && ic.not_null() && ic->size() >= 1 && ic->prefetch_ulong(1) == 1) {
+              auto mr = ic->prefetch_ref();
+              if (mr.not_null()) {
+                int mn = omg.fetch_add(1);
+                if (mn < OMAX) {
+                  auto ms = vm::load_cell_slice(mr);
+                  int tg = block::gen::t_CommonMsgInfo.get_tag(ms);
+                  const char* mt = tg==0?"int":tg==1?"ext_in":tg==2?"ext_out":"unk";
+                  std::ofstream f("/var/ton-work/observer/confirmed_messages.jsonl", std::ios::app);
+                  f << lat << "\t" << bid << "\t" << mt << "\tin\t" << acc << "\t" << tx.lt << "\n";
+                }
+              }
+            }
+
+            // out_msgs
+            auto& oc = tx.r1.out_msgs;
+            if (omg < OMAX && tx.outmsg_cnt > 0 && oc.not_null() && oc->size() >= 1 && oc->prefetch_ulong(1) == 1) {
+              auto dr = oc->prefetch_ref();
+              if (dr.not_null()) {
+                vm::Dictionary od{dr, 15};
+                od.check_for_each([&](td::Ref<vm::CellSlice> v, td::ConstBitPtr, int) -> bool {
+                  if (omg >= OMAX) return false;
+                  auto mr = v->prefetch_ref();
+                  if (mr.is_null()) return true;
+                  int mn = omg.fetch_add(1);
+                  if (mn < OMAX) {
+                    auto ms = vm::load_cell_slice(mr);
+                    int tg = block::gen::t_CommonMsgInfo.get_tag(ms);
+                    const char* mt = tg==0?"int":tg==1?"ext_in":tg==2?"ext_out":"unk";
+                    std::ofstream f("/var/ton-work/observer/confirmed_messages.jsonl", std::ios::app);
+                    f << lat << "\t" << bid << "\t" << mt << "\tout\t" << acc << "\t" << tx.lt << "\n";
+                  }
+                  return true;
+                });
+              }
+            }
+          }
+        }
+      }
+      if (otx >= OMAX && omg >= OMAX) {
+        LOG(WARNING) << "[OBSERVER] done: " << otx.load() << " tx, " << omg.load() << " msg";
+      }
+    }
+  }
+  // === END OBSERVER ===
+
   auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R) {
     if (R.is_error()) {
       td::actor::send_closure(SelfId, &ApplyBlock::abort_query, R.move_as_error());
