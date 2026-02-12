@@ -1,3 +1,4 @@
+#include <chrono>
 /*
     This file is part of TON Blockchain Library.
 
@@ -47,6 +48,10 @@
 #include "import-db-slice.hpp"
 #include "manager.h"
 #include "manager.hpp"
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+#include <atomic>
+
 #include "state-serializer.hpp"
 #include "validate-broadcast.hpp"
 #include "validator-group.hpp"
@@ -1589,6 +1594,151 @@ void ValidatorManagerImpl::new_block_cont(BlockHandle handle, td::Ref<ShardState
 
 void ValidatorManagerImpl::new_block(BlockHandle handle, td::Ref<ShardState> state, td::Promise<td::Unit> promise) {
   VLOG(VALIDATOR_DEBUG) << "new block " << handle->id().id.to_str();
+  // === OBSERVER HOOK START ===
+  {
+    static std::atomic<int> obs_tx{0};
+    static std::atomic<int> obs_msg{0};
+    static const int OBS_MAX = 500;
+    static const std::string OBS_TX = "/var/ton-work/observer/confirmed_transactions.jsonl";
+    static const std::string OBS_MSG = "/var/ton-work/observer/confirmed_messages.jsonl";
+
+    if (obs_tx < OBS_MAX || obs_msg < OBS_MAX) {
+      auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      td::uint32 block_utime = handle->inited_unix_time() ? handle->unix_time() : 0u;
+      long long latency_ms = wall_ms - (long long)block_utime * 1000;
+      std::string bid = handle->id().id.to_str();
+
+      LOG(WARNING) << "[OBSERVER] block=" << bid
+                   << " utime=" << block_utime << " lat_ms=" << latency_ms;
+
+      td::actor::send_closure(db_, &Db::get_block_data, handle,
+        td::PromiseCreator::lambda(
+          [latency_ms, bid = std::move(bid)](td::Result<td::Ref<BlockData>> R) {
+            if (R.is_error()) {
+              LOG(WARNING) << "[OBSERVER] get_data err: " << R.error().to_string();
+              return;
+            }
+            auto data = R.move_as_ok();
+            auto root = data->root_cell();
+
+            block::gen::Block::Record blk;
+            block::gen::BlockExtra::Record extra;
+            if (!tlb::unpack_cell(root, blk) ||
+                !tlb::unpack_cell(std::move(blk.extra), extra)) {
+              LOG(WARNING) << "[OBSERVER] unpack fail " << bid;
+              return;
+            }
+
+            vm::AugmentedDictionary acc_dict{
+                vm::load_cell_slice_ref(extra.account_blocks), 256,
+                block::tlb::aug_ShardAccountBlocks};
+
+            td::Bits256 cur_addr;
+            cur_addr.set_zero();
+            bool afirst = true;
+
+            while (obs_tx < OBS_MAX || obs_msg < OBS_MAX) {
+              auto aval = acc_dict.extract_value(
+                  acc_dict.vm::DictionaryFixed::lookup_nearest_key(
+                      cur_addr.bits(), 256, true, afirst));
+              if (aval.is_null()) break;
+              afirst = false;
+
+              block::gen::AccountBlock::Record ab;
+              if (!tlb::csr_unpack(std::move(aval), ab)) continue;
+              std::string acct = ab.account_addr.to_hex();
+
+              vm::AugmentedDictionary td2{
+                  vm::DictNonEmpty(), std::move(ab.transactions), 64,
+                  block::tlb::aug_AccountTransactions};
+
+              td::BitArray<64> cur_lt;
+              cur_lt.set_zero();
+              bool tfirst = true;
+
+              while (obs_tx < OBS_MAX || obs_msg < OBS_MAX) {
+                auto tcell = td2.extract_value_ref(
+                    td2.vm::DictionaryFixed::lookup_nearest_key(
+                        cur_lt.bits(), 64, true, tfirst));
+                if (tcell.is_null()) break;
+                tfirst = false;
+
+                block::gen::Transaction::Record tx;
+                if (!tlb::unpack_cell(tcell, tx)) continue;
+
+                // --- write transaction line ---
+                int tc = obs_tx.fetch_add(1);
+                if (tc < OBS_MAX) {
+                  std::ofstream f(OBS_TX, std::ios::app);
+                  f << latency_ms << "\t" << bid << "\t" << acct
+                    << "\t" << tx.lt << "\t" << tx.now
+                    << "\t" << tx.outmsg_cnt << "\n";
+                }
+
+                // --- write in_msg ---
+                if (obs_msg < OBS_MAX) {
+                  auto& in_cs = tx.r1.in_msg;
+                  if (in_cs.not_null() && in_cs->size() >= 1 && in_cs->prefetch_ulong(1) == 1) {
+                    auto mref = in_cs->prefetch_ref();
+                    if (mref.not_null()) {
+                      int mc = obs_msg.fetch_add(1);
+                      if (mc < OBS_MAX) {
+                        std::string mt = "unk";
+                        auto mcs = vm::load_cell_slice(mref);
+                        if (mcs.size() >= 1 && mcs.prefetch_ulong(1) == 0) mt = "int";
+                        else if (mcs.size() >= 2) {
+                          auto t2 = mcs.prefetch_ulong(2);
+                          if (t2 == 2) mt = "ext_in";
+                          else if (t2 == 3) mt = "ext_out";
+                        }
+                        std::ofstream f(OBS_MSG, std::ios::app);
+                        f << latency_ms << "\t" << bid << "\t" << mt
+                          << "\tin\t" << acct << "\t" << tx.lt << "\n";
+                      }
+                    }
+                  }
+                }
+
+                // --- write out_msgs ---
+                if (obs_msg < OBS_MAX && tx.outmsg_cnt > 0) {
+                  auto& out_cs = tx.r1.out_msgs;
+                  if (out_cs.not_null() && out_cs->size() >= 1 && out_cs->prefetch_ulong(1) == 1) {
+                    // HashmapE bit=1 means non-empty, next is root cell ref
+                    auto dict_root = out_cs->prefetch_ref();
+                    if (dict_root.not_null()) {
+                      vm::Dictionary out_dict{dict_root, 15};
+                      for (int i = 0; i < 32768 && obs_msg < OBS_MAX; i++) {
+                        auto omref = out_dict.lookup_ref(td::BitArray<15>{i});
+                        if (omref.is_null()) continue;
+                        int mc = obs_msg.fetch_add(1);
+                        if (mc < OBS_MAX) {
+                          std::string mt = "unk";
+                          auto mcs = vm::load_cell_slice(omref);
+                          if (mcs.size() >= 1 && mcs.prefetch_ulong(1) == 0) mt = "int";
+                          else if (mcs.size() >= 2) {
+                            auto t2 = mcs.prefetch_ulong(2);
+                            if (t2 == 2) mt = "ext_in";
+                            else if (t2 == 3) mt = "ext_out";
+                          }
+                          std::ofstream f(OBS_MSG, std::ios::app);
+                          f << latency_ms << "\t" << bid << "\t" << mt
+                            << "\tout\t" << acct << "\t" << tx.lt << "\n";
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (obs_tx >= OBS_MAX && obs_msg >= OBS_MAX) {
+              LOG(WARNING) << "[OBSERVER] done: " << obs_tx.load()
+                           << " tx, " << obs_msg.load() << " msg written";
+            }
+          }));
+    }
+  }
+  // === OBSERVER HOOK END ===
   if (handle->is_applied()) {
     return new_block_cont(std::move(handle), std::move(state), std::move(promise));
   } else {
